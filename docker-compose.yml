@@ -1,0 +1,29 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: novel-reader-mongo
+    restart: always
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-change_me}
+      MONGO_INITDB_DATABASE: ${MONGO_DATABASE:-novel_reader}
+    volumes:
+      - ./data/mongo:/data/db
+    ports:
+      - "127.0.0.1:27017:27017"
+
+  server:
+    build: .
+    container_name: novel-reader-server
+    restart: always
+    depends_on:
+      - mongo
+    environment:
+      NODE_ENV: production
+      PORT: ${PORT:-3000}
+      TOKEN_SECRET: ${TOKEN_SECRET:-dev_secret_change_me}
+      MONGO_DATABASE: ${MONGO_DATABASE:-novel_reader}
+      USERS_COLLECTION: ${USERS_COLLECTION:-users}
+      MONGO_URI: mongodb://${MONGO_ROOT_USERNAME:-root}:${MONGO_ROOT_PASSWORD:-change_me}@mongo:27017/${MONGO_DATABASE:-novel_reader}?authSource=admin
+    ports:
+      - "3000:3000"
