@@ -8,6 +8,10 @@ const { MongoClient } = require("mongodb");
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
+const path = require("path");
+
+const PUBLIC_DIR = process.env.PUBLIC_DIR || path.join(__dirname, "public");
+app.use("/files", express.static(path.join(PUBLIC_DIR, "files")));
 
 const PORT = Number(process.env.PORT || 3000);
 const TOKEN_SECRET = process.env.TOKEN_SECRET || process.env.JWT_SECRET || "dev_secret_change_me";
@@ -19,6 +23,7 @@ const USERS_COLLECTION = process.env.USERS_COLLECTION || "users";
 let mongoClient;
 let mongoDb;
 let users;
+let resourcePackages;
 
 function ok(data = {}) {
   return { code: 0, message: "ok", data };
@@ -125,6 +130,18 @@ async function connectDb() {
   await mongoClient.connect();
   mongoDb = mongoClient.db(MONGO_DATABASE);
   users = mongoDb.collection(USERS_COLLECTION);
+  resourcePackages = mongoDb.collection("original_resource_packages");
+
+  try {
+    await resourcePackages.createIndex({ scriptId: 1, version: -1 });
+    await resourcePackages.createIndex(
+      { scriptId: 1, version: 1 },
+      { unique: true }
+    );
+    await resourcePackages.createIndex({ enabled: 1 });
+  } catch (error) {
+    console.warn("create resource package indexes warning:", error.message);
+  }
 
   // 索引创建失败不应阻止服务启动；可能是旧数据有重复昵称/账号，日志里会提示。
   try {
@@ -587,6 +604,47 @@ app.post("/original/saves/delete", authRequired, async (req, res) => {
   } catch (error) {
     console.error("delete original save failed:", error);
     res.json(fail(error.message || "删除原创剧情存档失败"));
+  }
+});
+
+app.post("/original/resources/package", authRequired, async (req, res) => {
+  try {
+    await connectDb();
+
+    const scriptId = String(req.body.scriptId || "").trim();
+
+    if (!scriptId) {
+      return res.json(fail("缺少 scriptId"));
+    }
+
+    const pkg = await resourcePackages
+      .find({
+        scriptId,
+        enabled: { $ne: false }
+      })
+      .sort({ version: -1 })
+      .limit(1)
+      .next();
+
+    if (!pkg) {
+      return res.json(fail("资源包不存在"));
+    }
+
+    res.json(ok({
+      package: {
+        scriptId: pkg.scriptId,
+        version: Number(pkg.version || 1),
+        sizeBytes: Number(pkg.sizeBytes || 0),
+        sha256: pkg.sha256 || "",
+        downloadUrl: pkg.downloadUrl || "",
+        encryption: pkg.encryption || "AES-GCM",
+        keyBase64: pkg.keyBase64 || "",
+        ivBase64: pkg.ivBase64 || ""
+      }
+    }));
+  } catch (error) {
+    console.error("get original resource package failed:", error);
+    res.json(fail(error.message || "获取原创资源包失败"));
   }
 });
 
