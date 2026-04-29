@@ -299,6 +299,7 @@ app.post("/auth/password/register", async (req, res) => {
       todayInteractiveChars: 0,
       totalInteractiveChars: 0,
       totalAudiobookChars: 0,
+      originalSaves: {},
       deleted: false,
       createdAt: now(),
       updatedAt: now()
@@ -436,6 +437,156 @@ app.post("/user/stats/get", authRequired, async (req, res) => {
   } catch (error) {
     console.error("get stats failed:", error);
     res.json(fail(error.message || "获取统计数据失败"));
+  }
+});
+
+function sanitizeKey(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\./g, "_")
+    .replace(/\$/g, "_");
+}
+
+function normalizeOriginalSaveSlot(scriptId, slot) {
+  const safeScriptId = sanitizeKey(scriptId);
+  const safeSlot = slot && typeof slot === "object" ? { ...slot } : {};
+
+  const slotId = sanitizeKey(
+    safeSlot.slotId ||
+    safeSlot.id ||
+    safeSlot.saveId ||
+    "default"
+  );
+
+  return {
+    ...safeSlot,
+    slotId,
+    scriptId: safeScriptId,
+    updatedAt: now()
+  };
+}
+
+/**
+ * 同步原创互动剧存档。
+ *
+ * App 请求：
+ * {
+ *   "scriptId": "seven_nights_coast",
+ *   "slot": { ...OriginalSaveSlot... }
+ * }
+ *
+ * 返回：
+ * {
+ *   "slot": { ... }
+ * }
+ */
+app.post("/original/saves/sync", authRequired, async (req, res) => {
+  try {
+    await connectDb();
+
+    const scriptId = sanitizeKey(req.body.scriptId);
+    const slot = req.body.slot || {};
+
+    if (!scriptId) return res.json(fail("缺少 scriptId"));
+
+    const normalizedSlot = normalizeOriginalSaveSlot(scriptId, slot);
+    const slotId = normalizedSlot.slotId;
+
+    if (!slotId) return res.json(fail("缺少 slotId"));
+
+    const savePath = `originalSaves.${scriptId}.${slotId}`;
+
+    await users.updateOne(
+      { uid: req.user.uid, deleted: { $ne: true } },
+      {
+        $set: {
+          [savePath]: normalizedSlot,
+          updatedAt: now()
+        }
+      }
+    );
+
+    res.json(ok({ slot: normalizedSlot }));
+  } catch (error) {
+    console.error("sync original save failed:", error);
+    res.json(fail(error.message || "同步原创剧情存档失败"));
+  }
+});
+
+/**
+ * 获取原创互动剧存档列表。
+ *
+ * App 请求：
+ * {
+ *   "scriptId": "seven_nights_coast"
+ * }
+ *
+ * 返回：
+ * {
+ *   "slots": [...]
+ * }
+ */
+app.post("/original/saves/list", authRequired, async (req, res) => {
+  try {
+    const scriptId = sanitizeKey(req.body.scriptId);
+    if (!scriptId) return res.json(fail("缺少 scriptId"));
+
+    const user = await findUserByUid(req.user.uid);
+    const savesByScript =
+      user?.originalSaves &&
+      user.originalSaves[scriptId] &&
+      typeof user.originalSaves[scriptId] === "object"
+        ? user.originalSaves[scriptId]
+        : {};
+
+    const slots = Object.values(savesByScript)
+      .filter(Boolean)
+      .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
+
+    res.json(ok({ slots }));
+  } catch (error) {
+    console.error("list original saves failed:", error);
+    res.json(fail(error.message || "获取原创剧情存档失败"));
+  }
+});
+
+/**
+ * 删除原创互动剧存档。
+ *
+ * App 请求：
+ * {
+ *   "scriptId": "seven_nights_coast",
+ *   "slotId": "slot_1"
+ * }
+ */
+app.post("/original/saves/delete", authRequired, async (req, res) => {
+  try {
+    await connectDb();
+
+    const scriptId = sanitizeKey(req.body.scriptId);
+    const slotId = sanitizeKey(req.body.slotId);
+
+    if (!scriptId) return res.json(fail("缺少 scriptId"));
+    if (!slotId) return res.json(fail("缺少 slotId"));
+
+    const savePath = `originalSaves.${scriptId}.${slotId}`;
+
+    await users.updateOne(
+      { uid: req.user.uid, deleted: { $ne: true } },
+      {
+        $unset: {
+          [savePath]: ""
+        },
+        $set: {
+          updatedAt: now()
+        }
+      }
+    );
+
+    res.json(ok());
+  } catch (error) {
+    console.error("delete original save failed:", error);
+    res.json(fail(error.message || "删除原创剧情存档失败"));
   }
 });
 
