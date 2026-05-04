@@ -306,6 +306,8 @@ app.post("/auth/password/register", async (req, res) => {
       phone: "",
       avatarUrl: "",
       loginType: "password",
+      joinsRanking: true,
+      rankingVisible: true,
       dayKey: 0,
       todayReadingSeconds: 0,
       totalReadingSeconds: 0,
@@ -397,6 +399,42 @@ app.post("/account/delete", authRequired, async (req, res) => {
   }
 });
 
+app.post("/account/ranking/participation/get", authRequired, async (req, res) => {
+  try {
+    const joinsRanking = req.user.joinsRanking !== false;
+    const rankingVisible = req.user.rankingVisible !== false;
+
+    res.json(ok({
+      joinsRanking,
+      rankingVisible
+    }));
+  } catch (error) {
+    console.error("get ranking participation failed:", error);
+    res.json(fail(error.message || "获取排行榜参与状态失败"));
+  }
+});
+
+app.post("/account/ranking/participation/update", authRequired, async (req, res) => {
+  try {
+    const joinsRanking = req.body.joinsRanking !== false;
+    const rankingVisible = req.body.rankingVisible !== false;
+
+    await updateUserByUid(req.user.uid, {
+      joinsRanking,
+      rankingVisible,
+      updatedAt: now()
+    });
+
+    res.json(ok({
+      joinsRanking,
+      rankingVisible
+    }));
+  } catch (error) {
+    console.error("update ranking participation failed:", error);
+    res.json(fail(error.message || "更新排行榜参与状态失败"));
+  }
+});
+
 app.post("/user/stats/sync", authRequired, async (req, res) => {
   try {
     const incoming = normalizeStatsFromBody(req.body);
@@ -413,7 +451,19 @@ app.post("/user/stats/sync", authRequired, async (req, res) => {
       totalAudiobookChars: safeNumber(req.user.totalAudiobookChars)
     };
 
+
+
     const sameDay = incoming.dayKey > 0 && incoming.dayKey === oldStats.dayKey;
+    const joinsRanking =
+      typeof req.body.joinsRanking === "boolean"
+        ? req.body.joinsRanking
+        : req.user.joinsRanking !== false;
+
+    const rankingVisible =
+      typeof req.body.rankingVisible === "boolean"
+        ? req.body.rankingVisible
+        : req.user.rankingVisible !== false;
+    
     const merged = {
       dayKey: incoming.dayKey || oldStats.dayKey,
       todayReadingSeconds: sameDay ? Math.max(oldStats.todayReadingSeconds, incoming.todayReadingSeconds) : incoming.todayReadingSeconds,
@@ -425,6 +475,10 @@ app.post("/user/stats/sync", authRequired, async (req, res) => {
       totalRoleVoiceChars: Math.max(oldStats.totalRoleVoiceChars, incoming.totalRoleVoiceChars),
       totalInteractiveChars: Math.max(oldStats.totalInteractiveChars, incoming.totalInteractiveChars),
       totalAudiobookChars: Math.max(oldStats.totalAudiobookChars, incoming.totalAudiobookChars),
+
+      joinsRanking,
+      rankingVisible,
+      
       updatedAt: now()
     };
 
@@ -651,14 +705,21 @@ app.post("/original/resources/package", authRequired, async (req, res) => {
 app.post("/rankings", async (req, res) => {
   try {
     await connectDb();
+
+    const rankingFilter = {
+      deleted: { $ne: true },
+      joinsRanking: { $ne: false },
+      rankingVisible: { $ne: false }
+    };
+
     const readingRows = await users
-      .find({ deleted: { $ne: true } })
+      .find(rankingFilter)
       .sort({ totalReadingSeconds: -1 })
       .limit(50)
       .toArray();
 
     const audioRows = await users
-      .find({ deleted: { $ne: true } })
+      .find(rankingFilter)
       .sort({ totalAudiobookChars: -1 })
       .limit(50)
       .toArray();
