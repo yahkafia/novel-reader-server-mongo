@@ -319,6 +319,8 @@ app.post("/auth/password/register", async (req, res) => {
       totalInteractiveChars: 0,
       totalAudiobookChars: 0,
       originalSaves: {},
+      originalGacha: {},
+      originalUnlockFlags: {},
       deleted: false,
       createdAt: now(),
       updatedAt: now()
@@ -537,6 +539,259 @@ function normalizeOriginalSaveSlot(scriptId, slot) {
   };
 }
 
+// ================= 原创剧情抽卡 / 剧情点 =================
+
+const GACHA_CARD_IDS = ["linxia", "luxingyu", "sushiyan", "shenmo"];
+
+const STORY_POINT_UNIT_PER_POINT = 10;     // 1 剧情点 = 10 units
+const BLUE_CARD_REFUND_UNITS = 2;          // 普通蓝卡返还 0.2 剧情点 = 2 units
+const READING_SECONDS_PER_POINT = 600;     // 阅读 600 秒 = 1 剧情点
+const AUDIOBOOK_CHARS_PER_POINT = 500;     // 听书 500 字 = 1 剧情点
+const SINGLE_DRAW_COST_UNITS = 10;         // 每抽消耗 10 units
+const GOLD_RATE = 0.05;                    // 5% 出金
+const PITY_TRIGGER_COUNT = 9;              // 本抽前 pityCount == 9 时必出金
+
+// 隐藏剧情与金卡类型的绑定。
+// 如果客户端传 hiddenScriptId，这里会严格校验。
+// 如果后续客户端传的是具体视频 ID，也做了兼容。
+const HIDDEN_CARD_REQUIREMENTS = {
+  hidden_day4_linxia_luxingyu: "linxia",
+  hidden_day4_luxingyu_shenmo: "luxingyu",
+  hidden_day4_sushiyan_shenmo: "sushiyan",
+  hidden_day4_shenmo_luxingyu: "shenmo",
+
+  VID_D4_LX_LXY_HIDDEN_REEF_BOX: "linxia",
+  VID_D4_LX_LXY_HIDDEN_SHELL_PROMISE: "linxia",
+
+  VID_D4_LXY_SM_HIDDEN_REEF_CARD: "luxingyu",
+  VID_D4_LXY_SM_HIDDEN_CARD_HANDOVER: "luxingyu",
+
+  VID_D4_SSY_SM_HIDDEN_REEF_QUESTION: "sushiyan",
+  VID_D4_SSY_SM_HIDDEN_NO_FRAMEWORK: "sushiyan",
+
+  VID_D4_SM_LXY_HIDDEN_HIGH_REEF: "shenmo",
+  VID_D4_SM_LXY_HIDDEN_PAPER_BOAT: "shenmo"
+};
+
+function normalizeCardId(cardId) {
+  return String(cardId || "").trim().toLowerCase();
+}
+
+function normalizeCardInventory(raw) {
+  const source = raw && typeof raw === "object" ? raw : {};
+  const inventory = {};
+  for (const cardId of GACHA_CARD_IDS) {
+    inventory[cardId] = safeNumber(source[cardId]);
+  }
+  return inventory;
+}
+
+function normalizeUnlockedVideoIds(raw) {
+  if (!Array.isArray(raw)) return [];
+  return Array.from(
+    new Set(
+      raw
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+    )
+  );
+}
+
+function defaultOriginalGachaState(scriptId) {
+  return {
+    scriptId,
+    storyPointUnits: 0,
+    pityCount: 0,
+    spentReadingSeconds: 0,
+    spentAudiobookChars: 0,
+    cardInventory: normalizeCardInventory({}),
+    unlockedVideoIds: [],
+    updatedAt: now()
+  };
+}
+
+function normalizeOriginalGachaState(scriptId, raw) {
+  const item = raw && typeof raw === "object" ? raw : {};
+  return {
+    scriptId,
+    storyPointUnits: safeNumber(item.storyPointUnits),
+    pityCount: Math.min(safeNumber(item.pityCount), PITY_TRIGGER_COUNT),
+    spentReadingSeconds: safeNumber(item.spentReadingSeconds),
+    spentAudiobookChars: safeNumber(item.spentAudiobookChars),
+    cardInventory: normalizeCardInventory(item.cardInventory || item.inventory),
+    unlockedVideoIds: normalizeUnlockedVideoIds(
+      item.unlockedVideoIds || item.unlockedHiddenStories
+    ),
+    updatedAt: Number(item.updatedAt || now())
+  };
+}
+
+function getOriginalGachaStateFromUser(user, scriptId) {
+  const safeScriptId = sanitizeKey(scriptId);
+  const all =
+    user && user.originalGacha && typeof user.originalGacha === "object"
+      ? user.originalGacha
+      : {};
+  return normalizeOriginalGachaState(safeScriptId, all[safeScriptId]);
+}
+
+function toOriginalGachaResponse(state) {
+  return {
+    scriptId: state.scriptId,
+    storyPointUnits: safeNumber(state.storyPointUnits),
+    pityCount: Math.min(safeNumber(state.pityCount), PITY_TRIGGER_COUNT),
+    spentReadingSeconds: safeNumber(state.spentReadingSeconds),
+    spentAudiobookChars: safeNumber(state.spentAudiobookChars),
+    cardInventory: normalizeCardInventory(state.cardInventory),
+    unlockedVideoIds: normalizeUnlockedVideoIds(state.unlockedVideoIds)
+  };
+}
+
+function totalAudiobookCharsOfUser(user) {
+  const computed =
+    safeNumber(user.totalSingleVoiceChars) +
+    safeNumber(user.totalRoleVoiceChars) +
+    safeNumber(user.totalInteractiveChars);
+
+  return Math.max(safeNumber(user.totalAudiobookChars), computed);
+}
+
+function buildExchangePreview(user, state) {
+  const totalReadingSeconds = safeNumber(user.totalReadingSeconds);
+  const totalAudiobookChars = totalAudiobookCharsOfUser(user);
+
+  const remainingReadingSeconds = Math.max(
+    0,
+    totalReadingSeconds - safeNumber(state.spentReadingSeconds)
+  );
+
+  const remainingAudiobookChars = Math.max(
+    0,
+    totalAudiobookChars - safeNumber(state.spentAudiobookChars)
+  );
+
+  return {
+    maxByReading: Math.floor(remainingReadingSeconds / READING_SECONDS_PER_POINT),
+    maxByAudiobook: Math.floor(remainingAudiobookChars / AUDIOBOOK_CHARS_PER_POINT)
+  };
+}
+
+function pickGoldCardId() {
+  const index = Math.floor(Math.random() * GACHA_CARD_IDS.length);
+  return GACHA_CARD_IDS[index];
+}
+
+function getRequiredCardIdForVideo(videoId) {
+  const raw = String(videoId || "").trim();
+  if (!raw) return "";
+
+  if (HIDDEN_CARD_REQUIREMENTS[raw]) {
+    return HIDDEN_CARD_REQUIREMENTS[raw];
+  }
+
+  // 小写兼容，比如客户端传 hidden_day4_linxia_luxingyu
+  const lowerMap = {};
+  for (const [key, value] of Object.entries(HIDDEN_CARD_REQUIREMENTS)) {
+    lowerMap[key.toLowerCase()] = value;
+  }
+
+  return lowerMap[raw.toLowerCase()] || "";
+}
+
+async function withOptionalTransaction(handler) {
+  await connectDb();
+
+  if (!mongoClient || typeof mongoClient.startSession !== "function") {
+    return handler(undefined);
+  }
+
+  const session = mongoClient.startSession();
+
+  try {
+    let result;
+    await session.withTransaction(async () => {
+      result = await handler(session);
+    });
+    return result;
+  } catch (error) {
+    const message = String((error && error.message) || "");
+    const unsupported =
+      message.includes("Transaction numbers are only allowed") ||
+      message.includes("replica set") ||
+      message.includes("not a replica set") ||
+      error.codeName === "IllegalOperation";
+
+    if (!unsupported) throw error;
+
+    console.warn("MongoDB transaction unsupported, fallback without transaction:", message);
+    return handler(undefined);
+  } finally {
+    await session.endSession();
+  }
+}
+
+function sessionOption(session) {
+  return session ? { session } : undefined;
+}
+
+function buildOriginalUnlockSavePatch(user, scriptId, videoId) {
+  const safeScriptId = sanitizeKey(scriptId);
+  const safeVideoKey = sanitizeKey(videoId);
+
+  const patch = {
+    [`originalUnlockFlags.${safeScriptId}.${safeVideoKey}`]: true
+  };
+
+  const allSaves =
+    user && user.originalSaves && typeof user.originalSaves === "object"
+      ? user.originalSaves
+      : {};
+
+  const savesByScript = allSaves[safeScriptId];
+
+  if (!savesByScript || typeof savesByScript !== "object") {
+    return patch;
+  }
+
+  const updatedSavesByScript = {};
+
+  for (const [slotId, slotValue] of Object.entries(savesByScript)) {
+    if (!slotValue || typeof slotValue !== "object") {
+      updatedSavesByScript[slotId] = slotValue;
+      continue;
+    }
+
+    const slot = { ...slotValue };
+
+    if (Array.isArray(slot.flags)) {
+      slot.flags = Array.from(new Set([...slot.flags, videoId]));
+    } else if (slot.flags && typeof slot.flags === "object") {
+      slot.flags = {
+        ...slot.flags,
+        [videoId]: true,
+        [`unlocked_${videoId}`]: true
+      };
+    } else {
+      slot.flags = {
+        [videoId]: true,
+        [`unlocked_${videoId}`]: true
+      };
+    }
+
+    if (Array.isArray(slot.unlockedVideoIds)) {
+      slot.unlockedVideoIds = Array.from(new Set([...slot.unlockedVideoIds, videoId]));
+    } else {
+      slot.unlockedVideoIds = [videoId];
+    }
+
+    slot.updatedAt = now();
+    updatedSavesByScript[slotId] = slot;
+  }
+
+  patch[`originalSaves.${safeScriptId}`] = updatedSavesByScript;
+  return patch;
+}
+
 /**
  * 同步原创互动剧存档。
  *
@@ -658,6 +913,330 @@ app.post("/original/saves/delete", authRequired, async (req, res) => {
   } catch (error) {
     console.error("delete original save failed:", error);
     res.json(fail(error.message || "删除原创剧情存档失败"));
+  }
+});
+
+/**
+ * 获取原创剧情抽卡状态。
+ *
+ * App 请求：
+ * {
+ *   "scriptId": "seven_night_beach"
+ * }
+ */
+app.post("/original/gacha/state", authRequired, async (req, res) => {
+  try {
+    await connectDb();
+
+    const scriptId = sanitizeKey(req.body.scriptId);
+    if (!scriptId) return res.json(fail("缺少 scriptId"));
+
+    const user = await findUserByUid(req.user.uid);
+    const state = getOriginalGachaStateFromUser(user, scriptId);
+
+    if (!user.originalGacha || !user.originalGacha[scriptId]) {
+      await users.updateOne(
+        { uid: req.user.uid, deleted: { $ne: true } },
+        {
+          $set: {
+            [`originalGacha.${scriptId}`]: state,
+            updatedAt: now()
+          }
+        }
+      );
+    }
+
+    res.json(ok({ gacha: toOriginalGachaResponse(state) }));
+  } catch (error) {
+    console.error("get original gacha state failed:", error);
+    res.json(fail(error.message || "获取剧情点状态失败"));
+  }
+});
+
+/**
+ * 兑换预览。
+ *
+ * 阅读：
+ * floor((totalReadingSeconds - spentReadingSeconds) / 600)
+ *
+ * 听书：
+ * floor((totalSingleVoiceChars + totalRoleVoiceChars + totalInteractiveChars - spentAudiobookChars) / 500)
+ */
+app.post("/original/gacha/exchange/preview", authRequired, async (req, res) => {
+  try {
+    const scriptId = sanitizeKey(req.body.scriptId);
+    if (!scriptId) return res.json(fail("缺少 scriptId"));
+
+    const user = await findUserByUid(req.user.uid);
+    const state = getOriginalGachaStateFromUser(user, scriptId);
+    const preview = buildExchangePreview(user, state);
+
+    res.json(ok({ preview }));
+  } catch (error) {
+    console.error("preview original gacha exchange failed:", error);
+    res.json(fail(error.message || "获取兑换预览失败"));
+  }
+});
+
+/**
+ * 兑换剧情点。
+ *
+ * App 请求：
+ * {
+ *   "scriptId": "seven_night_beach",
+ *   "source": "reading" | "audiobook",
+ *   "points": 1
+ * }
+ */
+app.post("/original/gacha/exchange", authRequired, async (req, res) => {
+  try {
+    const scriptId = sanitizeKey(req.body.scriptId);
+    const source = String(req.body.source || "").trim();
+    const points = safeNumber(req.body.points);
+
+    if (!scriptId) return res.json(fail("缺少 scriptId"));
+    if (source !== "reading" && source !== "audiobook") {
+      return res.json(fail("兑换来源无效"));
+    }
+    if (points <= 0) {
+      return res.json(fail("兑换剧情点数量必须大于0"));
+    }
+
+    const result = await withOptionalTransaction(async (session) => {
+      const user = await users.findOne(
+        { uid: req.user.uid, deleted: { $ne: true } },
+        sessionOption(session)
+      );
+
+      if (!user) throw new Error("账号不存在或已注销");
+
+      const state = getOriginalGachaStateFromUser(user, scriptId);
+      const preview = buildExchangePreview(user, state);
+      const maxAllowed =
+        source === "reading" ? preview.maxByReading : preview.maxByAudiobook;
+
+      if (points > maxAllowed) {
+        throw new Error(
+          source === "reading" ? "可兑换阅读时长不足" : "可兑换听书字数不足"
+        );
+      }
+
+      const newState = {
+        ...state,
+        storyPointUnits:
+          safeNumber(state.storyPointUnits) + points * STORY_POINT_UNIT_PER_POINT,
+        spentReadingSeconds:
+          safeNumber(state.spentReadingSeconds) +
+          (source === "reading" ? points * READING_SECONDS_PER_POINT : 0),
+        spentAudiobookChars:
+          safeNumber(state.spentAudiobookChars) +
+          (source === "audiobook" ? points * AUDIOBOOK_CHARS_PER_POINT : 0),
+        updatedAt: now()
+      };
+
+      await users.updateOne(
+        { uid: req.user.uid, deleted: { $ne: true } },
+        {
+          $set: {
+            [`originalGacha.${scriptId}`]: newState,
+            updatedAt: now()
+          }
+        },
+        sessionOption(session)
+      );
+
+      const previewAfter = buildExchangePreview(user, newState);
+
+      return {
+        gacha: toOriginalGachaResponse(newState),
+        preview: previewAfter
+      };
+    });
+
+    res.json(ok(result));
+  } catch (error) {
+    console.error("original gacha exchange failed:", error);
+    res.json(fail(error.message || "兑换剧情点失败"));
+  }
+});
+
+/**
+ * 抽卡。
+ *
+ * 规则：
+ * - 每抽消耗 10 units
+ * - 金卡概率 5%
+ * - 本抽前 pityCount == 9 时必出金
+ * - 未出金返还 2 units
+ * - 金卡四角色等概率
+ */
+app.post("/original/gacha/draw", authRequired, async (req, res) => {
+  try {
+    const scriptId = sanitizeKey(req.body.scriptId);
+    const count = safeNumber(req.body.count);
+
+    if (!scriptId) return res.json(fail("缺少 scriptId"));
+    if (count !== 1 && count !== 10) {
+      return res.json(fail("抽卡次数只能是 1 或 10"));
+    }
+
+    const result = await withOptionalTransaction(async (session) => {
+      const user = await users.findOne(
+        { uid: req.user.uid, deleted: { $ne: true } },
+        sessionOption(session)
+      );
+
+      if (!user) throw new Error("账号不存在或已注销");
+
+      const state = getOriginalGachaStateFromUser(user, scriptId);
+      const totalCost = count * SINGLE_DRAW_COST_UNITS;
+
+      if (safeNumber(state.storyPointUnits) < totalCost) {
+        throw new Error("剧情点不足");
+      }
+
+      const newState = {
+        ...state,
+        storyPointUnits: safeNumber(state.storyPointUnits) - totalCost,
+        pityCount: Math.min(safeNumber(state.pityCount), PITY_TRIGGER_COUNT),
+        cardInventory: normalizeCardInventory(state.cardInventory),
+        unlockedVideoIds: normalizeUnlockedVideoIds(state.unlockedVideoIds),
+        updatedAt: now()
+      };
+
+      const items = [];
+
+      for (let i = 0; i < count; i += 1) {
+        const mustGold = safeNumber(newState.pityCount) >= PITY_TRIGGER_COUNT;
+        const isGold = mustGold || Math.random() < GOLD_RATE;
+
+        if (isGold) {
+          const cardId = pickGoldCardId();
+
+          newState.cardInventory[cardId] =
+            safeNumber(newState.cardInventory[cardId]) + 1;
+
+          newState.pityCount = 0;
+
+          items.push({
+            type: "gold_card",
+            cardId,
+            storyPointUnits: 0
+          });
+        } else {
+          newState.storyPointUnits += BLUE_CARD_REFUND_UNITS;
+          newState.pityCount = safeNumber(newState.pityCount) + 1;
+
+          items.push({
+            type: "story_point",
+            storyPointUnits: BLUE_CARD_REFUND_UNITS
+          });
+        }
+      }
+
+      await users.updateOne(
+        { uid: req.user.uid, deleted: { $ne: true } },
+        {
+          $set: {
+            [`originalGacha.${scriptId}`]: newState,
+            updatedAt: now()
+          }
+        },
+        sessionOption(session)
+      );
+
+      return {
+        items,
+        gacha: toOriginalGachaResponse(newState)
+      };
+    });
+
+    res.json(ok(result));
+  } catch (error) {
+    console.error("original gacha draw failed:", error);
+    res.json(fail(error.message || "抽卡失败"));
+  }
+});
+
+/**
+ * 使用角色金卡解锁隐藏剧情。
+ *
+ * App 请求：
+ * {
+ *   "scriptId": "seven_night_beach",
+ *   "cardId": "linxia",
+ *   "videoId": "hidden_day4_linxia_luxingyu"
+ * }
+ */
+app.post("/original/gacha/use-card", authRequired, async (req, res) => {
+  try {
+    const scriptId = sanitizeKey(req.body.scriptId);
+    const cardId = normalizeCardId(req.body.cardId);
+    const videoId = String(req.body.videoId || "").trim();
+
+    if (!scriptId) return res.json(fail("缺少 scriptId"));
+    if (!GACHA_CARD_IDS.includes(cardId)) {
+      return res.json(fail("金卡类型无效"));
+    }
+    if (!videoId) return res.json(fail("缺少 videoId"));
+
+    const requiredCardId = getRequiredCardIdForVideo(videoId);
+    if (requiredCardId && requiredCardId !== cardId) {
+      return res.json(fail(`该隐藏剧情需要 ${requiredCardId} 金卡解锁`));
+    }
+
+    const result = await withOptionalTransaction(async (session) => {
+      const user = await users.findOne(
+        { uid: req.user.uid, deleted: { $ne: true } },
+        sessionOption(session)
+      );
+
+      if (!user) throw new Error("账号不存在或已注销");
+
+      const state = getOriginalGachaStateFromUser(user, scriptId);
+      const inventory = normalizeCardInventory(state.cardInventory);
+      const unlockedVideoIds = normalizeUnlockedVideoIds(state.unlockedVideoIds);
+
+      if (unlockedVideoIds.includes(videoId)) {
+        throw new Error("该隐藏剧情已解锁");
+      }
+
+      if (safeNumber(inventory[cardId]) <= 0) {
+        throw new Error("对应角色金卡数量不足");
+      }
+
+      inventory[cardId] -= 1;
+
+      const newState = {
+        ...state,
+        cardInventory: inventory,
+        unlockedVideoIds: [...unlockedVideoIds, videoId],
+        updatedAt: now()
+      };
+
+      const unlockPatch = buildOriginalUnlockSavePatch(user, scriptId, videoId);
+
+      await users.updateOne(
+        { uid: req.user.uid, deleted: { $ne: true } },
+        {
+          $set: {
+            [`originalGacha.${scriptId}`]: newState,
+            ...unlockPatch,
+            updatedAt: now()
+          }
+        },
+        sessionOption(session)
+      );
+
+      return {
+        gacha: toOriginalGachaResponse(newState)
+      };
+    });
+
+    res.json(ok(result));
+  } catch (error) {
+    console.error("use original gacha card failed:", error);
+    res.json(fail(error.message || "使用金卡失败"));
   }
 });
 
